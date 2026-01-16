@@ -42,13 +42,24 @@ export const GoogleAISearchPlugin: Plugin = async (_input: PluginInput) => {
       try {
         const result = await globalManager.query(args.query, args.followUp ?? false, timeoutMs, ctx.abort)
         const formattedResponse = formatAIResponse(result)
+        
+        ctx.metadata({
+          title: `Google AI: ${args.query}`,
+          metadata: {
+            query: args.query,
+            sourceCount: result.sources.count,
+            responseTime: result.metadata.responseTime,
+            hasTable: result.tableData.length > 0,
+          },
+        })
+        
         return `# Google AI Mode: ${args.query}\n\n${formattedResponse}`
       } catch (error) {
         const message = (error as Error).message
         if (message.includes("Timeout") || message.includes("forSelector") || message.includes("blocking")) {
-          return `Google AI Mode unavailable: Automated access is currently blocked by Google. This is expected behavior and you should try again in a few minutes.`
+          throw new Error("Google AI Mode unavailable: Automated access is currently blocked by Google. This is expected behavior and you should try again in a few minutes.")
         }
-        return `Error searching Google AI: ${message}`
+        throw error
       } finally {
         globalManager.startIdleTimer()
       }
