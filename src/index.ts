@@ -43,7 +43,7 @@ export const GoogleAISearchPlugin: Plugin = async (_input: PluginInput) => {
         const result = await globalManager.query(args.query, args.followUp ?? false, timeoutMs, ctx.abort)
         const formattedResponse = formatAIResponse(result)
         
-        ctx.metadata({
+        (ctx as any).metadata({
           title: `Google AI: ${args.query}`,
           metadata: {
             query: args.query,
