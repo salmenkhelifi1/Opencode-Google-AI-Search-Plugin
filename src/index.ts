@@ -1,4 +1,5 @@
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin, PluginInput } from "@opencode-ai/plugin"
+import { tool } from "@opencode-ai/plugin"
 import TurndownService from "turndown"
 
 type PlaywrightModule = typeof import("playwright")
@@ -8,74 +9,55 @@ type Page = Awaited<ReturnType<Browser["newPage"]>>
 
 const DEFAULT_TIMEOUT = 30_000
 const MAX_TIMEOUT = 120_000
+const IDLE_TIMEOUT = 5 * 60 * 1000
 
-export const GoogleAISearchPlugin: Plugin = async ({ Tool, z }) => {
-  const GoogleAITool = Tool.define("google_ai_search_plus", {
+let globalManager: GoogleAIModeManager | null = null
+
+export const GoogleAISearchPlugin: Plugin = async (_input: PluginInput) => {
+  const GoogleAITool = tool({
     description: "Search the web using Google's AI-powered search mode. This tool provides comprehensive, AI-enhanced search results with contextual information, summaries, and source references. Use this for any web searches, current events, factual lookups, research questions, or when you need up-to-date information beyond your knowledge cutoff. Returns structured markdown responses with sources.",
-    parameters: z
-      .object({
-        query: z.string().describe("Question or topic to submit to Google AI Mode"),
-        timeout: z
-          .number()
-          .min(5)
-          .max(120)
-          .optional()
-          .describe("Timeout in seconds (default: 30, max: 120)"),
-        followUp: z
-          .boolean()
-          .optional()
-          .describe("Treat the query as a follow-up in the same session")
-      })
-      .describe("Parameters for google_ai_search_plus"),
-    async execute(params: any, ctx: any) {
-      const playwright = await loadPlaywright()
-      const manager = new GoogleAIModeManager(playwright)
-      const timeoutMs = Math.min((params.timeout ?? DEFAULT_TIMEOUT / 1000) * 1000, MAX_TIMEOUT)
-
-      const abortHandler = () => {
-        manager.dispose().catch(() => undefined)
+    args: {
+      query: tool.schema.string().describe("Question or topic to submit to Google AI Mode"),
+      timeout: tool.schema
+        .number()
+        .min(5)
+        .max(120)
+        .optional()
+        .describe("Timeout in seconds (default: 30, max: 120)"),
+      followUp: tool.schema
+        .boolean()
+        .optional()
+        .describe("Treats the query as a follow-up in the same conversation (session reuse)"),
+    },
+    async execute(args, ctx) {
+      if (!globalManager) {
+        const playwright = await loadPlaywright()
+        globalManager = new GoogleAIModeManager(playwright)
       }
-      ctx.abort.addEventListener("abort", abortHandler, { once: true })
+
+      const timeoutMs = Math.min((args.timeout ?? DEFAULT_TIMEOUT / 1000) * 1000, MAX_TIMEOUT)
+
+      globalManager.clearIdleTimer()
 
       try {
-        const result = await manager.query(params.query, params.followUp ?? false, timeoutMs, ctx.abort)
-
-        ctx.metadata({
-          title: `Google AI: ${params.query}`,
-          metadata: {
-            query: params.query,
-            sourceCount: result.sources.count,
-            responseTime: result.metadata.responseTime,
-            hasTable: result.tableData.length > 0,
-          },
-        })
-
-        return {
-          title: `Google AI Mode: ${params.query}`,
-          output: formatAIResponse(result),
-          metadata: {
-            query: result.query,
-            responseTime: result.metadata.responseTime,
-            sources: result.sources,
-            hasTable: result.tableData.length > 0,
-          },
-        }
+        const result = await globalManager.query(args.query, args.followUp ?? false, timeoutMs, ctx.abort)
+        const formattedResponse = formatAIResponse(result)
+        return `# Google AI Mode: ${args.query}\n\n${formattedResponse}`
       } catch (error) {
         const message = (error as Error).message
-        if (message.includes("Timeout") || message.includes("forSelector")) {
-          throw new Error("Google AI Mode unavailable: automated access is currently blocked. This is expected behaviour.")
+        if (message.includes("Timeout") || message.includes("forSelector") || message.includes("blocking")) {
+          return `Google AI Mode unavailable: Automated access is currently blocked by Google. This is expected behavior and you should try again in a few minutes.`
         }
-        throw error
+        return `Error searching Google AI: ${message}`
       } finally {
-        ctx.abort.removeEventListener("abort", abortHandler)
-        await manager.dispose()
+        globalManager.startIdleTimer()
       }
     },
   })
 
   return {
-    async ["tool.register"](_input, { register }) {
-      register(GoogleAITool)
+    tool: {
+      google_ai_search_plus: GoogleAITool,
     },
   }
 }
@@ -84,14 +66,10 @@ async function loadPlaywright(): Promise<PlaywrightModule> {
   try {
     return await import("playwright")
   } catch (error) {
-    try {
-      return await import("/tmp/node_modules/playwright")
-    } catch {
-      throw new Error(
-        "google_ai_search_plus requires Playwright. Install it with: bun install playwright && bunx playwright install chromium",
-        { cause: error },
-      )
-    }
+    throw new Error(
+      "google_ai_search_plus requires Playwright. Install it with: bun install playwright && npx playwright install chromium",
+      { cause: error },
+    )
   }
 }
 
@@ -101,22 +79,52 @@ class GoogleAIModeManager {
   private conversationActive = false
   private sessionStartTime = Date.now()
   private readonly SESSION_TIMEOUT = 5 * 60 * 1000
+  private idleTimer: ReturnType<typeof setTimeout> | null = null
+  private queryLock = false
 
   constructor(private readonly playwright: PlaywrightModule) {}
 
+  startIdleTimer() {
+    this.clearIdleTimer()
+    this.idleTimer = setTimeout(() => {
+      this.dispose().catch(() => undefined)
+    }, IDLE_TIMEOUT)
+  }
+
+  clearIdleTimer() {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer)
+      this.idleTimer = null
+    }
+  }
+
   async query(query: string, followUp: boolean, timeout: number, abortSignal: AbortSignal): Promise<AIResponse> {
-    if (Date.now() - this.sessionStartTime > this.SESSION_TIMEOUT) {
-      await this.reset()
+    const lockWaitStart = Date.now()
+    while (this.queryLock) {
+      if (Date.now() - lockWaitStart > timeout) {
+        throw new Error("System busy: multiple search requests")
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200))
     }
+    
+    this.queryLock = true
 
-    await this.ensureBrowserSession()
+    try {
+      if (Date.now() - this.sessionStartTime > this.SESSION_TIMEOUT) {
+        await this.resetConversation()
+      }
 
-    if (!followUp || !this.conversationActive) {
-      await this.navigateToAIMode()
-      this.conversationActive = true
+      await this.ensureBrowserSession()
+
+      if (!followUp || !this.conversationActive) {
+        await this.navigateToAIMode()
+        this.conversationActive = true
+      }
+
+      return await this.submitQuery(query, timeout, abortSignal)
+    } finally {
+      this.queryLock = false
     }
-
-    return await this.submitQuery(query, timeout, abortSignal)
   }
 
   private async ensureBrowserSession() {
@@ -142,7 +150,7 @@ class GoogleAIModeManager {
           get: () => false,
         })
 
-        const chrome = (window as any).chrome
+        const chrome = (window as unknown as Record<string, unknown>).chrome as Record<string, Record<string, unknown>> | undefined
         if (chrome?.runtime?.onConnect) {
           delete chrome.runtime.onConnect
         }
@@ -151,6 +159,8 @@ class GoogleAIModeManager {
           get: () => ["en-GB", "en-US", "en"],
         })
       })
+      
+      this.sessionStartTime = Date.now()
     }
   }
 
@@ -205,6 +215,10 @@ class GoogleAIModeManager {
       }
 
       previousLength = currentLength
+
+      if (abortSignal.aborted) {
+        throw new Error("Operation aborted")
+      }
     }
 
     const hasContent = await this.page.evaluate(() => {
@@ -255,13 +269,12 @@ class GoogleAIModeManager {
       const main = (root.querySelector(".mZJni.Dn7Fzd") as HTMLElement | null) || root
       const contentContainer = (main.querySelector(".Zkbeff") as HTMLElement | null) || main
 
-      const blockSelectors =
-        "[role=\"heading\"], h1, h2, h3, h4, h5, h6, .Y3BBE, .Fv6NCb, table, ul, ol, p"
+      const blockSelectors = "[role=\"heading\"], h1, h2, h3, h4, h5, h6, .Y3BBE, .Fv6NCb, table, ul, ol, p"
       const orderedNodes = Array.from(
         contentContainer.querySelectorAll(blockSelectors),
       ) as HTMLElement[]
 
-      const blocks: Array<any> = []
+      const blocks: Array<{type: string; text?: string; level?: number; ordered?: boolean; heading?: string; items?: string[]}> = []
       const listHeadingMarkers = new Set<HTMLElement>()
       const paragraphTexts = new Set<string>()
       let summary = ""
@@ -427,9 +440,10 @@ class GoogleAIModeManager {
 
     const answerSections: string[] = []
     const tableRows: ComparisonRow[] = []
-    const tableHeaders = (((extraction.table as any)?.header ?? []) as string[]).slice(0, 3)
+    const extractedTable = extraction.table as { header: string[]; rows: string[][] } | null
+    const tableHeaders = ((extractedTable?.header ?? []) as string[]).slice(0, 3)
 
-    extraction.blocks?.forEach((block: any) => {
+    extraction.blocks?.forEach((block) => {
       if (!block || !block.type) return
 
       if (block.type === "heading" && block.text) {
@@ -454,9 +468,9 @@ class GoogleAIModeManager {
         return
       }
 
-      if (block.type === "table" && extraction.table) {
-        const headers = (((extraction.table as any).header || []) as string[]).slice(0, 3)
-        const rows = ((extraction.table as any).rows || []) as string[][]
+      if (block.type === "table" && extractedTable) {
+        const headers = ((extractedTable.header || []) as string[]).slice(0, 3)
+        const rows = (extractedTable.rows || []) as string[][]
         if (headers.length >= 2 && rows.length > 0) {
           const headerLine = `| ${headers.join(" | ")} |`
           const separator = `|${headers.map(() => "---").join("|")}|`
@@ -561,7 +575,7 @@ class GoogleAIModeManager {
     }
   }
 
-  async reset() {
+  async resetConversation() {
     this.conversationActive = false
     this.sessionStartTime = Date.now()
     try {
@@ -576,6 +590,7 @@ class GoogleAIModeManager {
   }
 
   async dispose() {
+    this.clearIdleTimer()
     if (this.page) {
       await this.page.close().catch(() => undefined)
       this.page = null
@@ -585,11 +600,14 @@ class GoogleAIModeManager {
       this.browser = null
     }
     this.conversationActive = false
+    if (globalManager === this) {
+      globalManager = null
+    }
   }
 }
 
 function formatAIResponse(response: AIResponse): string {
-  let output = `# ${response.query}\n\n`
+  let output = ""
 
   if (response.summary && response.summary !== response.answer) {
     output += `**Summary**: ${response.summary}\n\n`
